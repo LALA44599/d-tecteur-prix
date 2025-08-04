@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# detector.py — Détecteur d'erreurs de prix (avec alerte Telegram + test local)
-# 1) lit urls.csv (liste d'URLs produit)
-# 2) extrait le prix (JSON-LD, meta, sélecteurs, ou fichier local file:///)
-# 3) enregistre l'historique (SQLite prix.db)
-# 4) détecte anomalie (médiane+MAD ou seuil < 1 €) et envoie une alerte Telegram
+# detector.py — Détecteur d'erreurs de prix (6 sites + alerte Telegram)
+# - lit urls.csv (généré par collect_urls.py)
+# - extrait le prix (JSON-LD, meta, ou sélecteurs de secours)
+# - enregistre l'historique (SQLite prix.db)
+# - alerte si prix < 1 € ou très bas vs historique (Médiane+MAD)
 
 import csv, os, re, json, time, sqlite3, requests
 from bs4 import BeautifulSoup
@@ -16,9 +16,16 @@ MIN_POINTS = 8        # historique mini avant de juger
 REL_FACTOR = 0.40     # alerte si prix < 40% de la médiane historique
 ABS_FLOOR  = 1.00     # alerte immédiate si prix < 1.00 €
 
-# Sélecteurs connus par domaine (tu peux en ajouter)
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DetecteurPrixBot/1.0)"}
+
+# Sélecteurs de secours par domaine
 SELECTEURS_PAR_SITE = {
-    "books.toscrape.com": ["p.price_color"],
+    "alltricks.fr":   ["[itemprop=price]", "[class*=price]"],
+    "cdiscount.com":  ["meta[itemprop=price]", "[class*=price]", "[id*=price]"],
+    "leroymerlin.fr": ["[itemprop=price]", "[data-qa=product-price]", "[class*=price]"],
+    "ikea.com":       ["[itemprop=price]", "[class*=price]"],
+    "fnac.com":       ['meta[property="product:price:amount"]', "[class*=price]"],
+    "boulanger.com":  ["meta[itemprop=price]", "[class*=price]"],
 }
 
 # ---------- Envoi Telegram ----------
@@ -26,8 +33,7 @@ def send_telegram(text: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("Telegram non configuré (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID manquants).")
-        return
+        print("Telegram non configuré."); return
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -54,9 +60,15 @@ def _jsonld_prices(soup):
         blocks = data if isinstance(data, list) else [data]
         for b in blocks:
             if not isinstance(b, dict): continue
-            if b.get("@type") == "Product" and isinstance(b.get("offers"), dict):
-                p = b["offers"].get("price")
-                if p is not None: yield str(p)
+            # Product + offers.price
+            if b.get("@type") == "Product":
+                offers = b.get("offers")
+                if isinstance(offers, dict) and offers.get("price") is not None:
+                    yield str(offers["price"])
+                ps = b.get("offers", {}).get("priceSpecification", {})
+                if isinstance(ps, dict) and ps.get("price") is not None:
+                    yield str(ps["price"])
+            # Offer direct
             if b.get("@type") == "Offer" and b.get("price") is not None:
                 yield str(b["price"])
 
@@ -74,25 +86,17 @@ def _meta_prices(soup):
 def _text_prices(soup, host):
     for sel in SELECTEURS_PAR_SITE.get(host, []):
         for el in soup.select(sel): yield el.get_text(" ", strip=True)
-    for sel in ("[class*=price]", "[id*=price]"):  # générique
+    for sel in ("[class*=price]", "[id*=price]"):
         for el in soup.select(sel): yield el.get_text(" ", strip=True)
 
 def extract_price(url: str) -> float:
-    # --- support des fichiers locaux: file:///C:/.../test.html
-    if url.lower().startswith("file:///"):
-        from urllib.parse import urlparse, unquote
-        p = urlparse(url)
-        local_path = unquote(p.path.lstrip("/"))  # ex: C:/detecteur_prix/test.html
-        with open(local_path, encoding="utf-8") as f:
-            html = f.read()
-        soup = BeautifulSoup(html, "html.parser")
-    else:
-        r = requests.get(url, timeout=25)
-        r.encoding = "utf-8"
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-    host = re.sub(r"^https?://", "", url).split("/")[0]
+    if "amazon." in url:
+        raise RuntimeError("Amazon: utiliser l'API Keepa (non activée ici).")
+    r = requests.get(url, timeout=40, headers=HEADERS)
+    r.encoding = r.encoding or "utf-8"
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    host = re.sub(r"^https?://", "", url).split("/")[0].lower()
 
     candidates = []
     candidates += list(_jsonld_prices(soup))
@@ -111,12 +115,30 @@ def init_db():
     con.execute("""CREATE TABLE IF NOT EXISTS prices(
         url TEXT, name TEXT, ts INTEGER, price REAL
     )""")
+    con.execute("""CREATE INDEX IF NOT EXISTS idx_prices ON prices(url, ts)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS alerts(
+        url TEXT, ts INTEGER, price REAL, msg TEXT
+    )""")
     con.commit(); con.close()
 
 def save_price(url, name, price):
     con = sqlite3.connect(DB_FILE)
     con.execute("INSERT INTO prices(url,name,ts,price) VALUES(?,?,?,?)",
                 (url, name, int(time.time()), price))
+    con.commit(); con.close()
+
+def recently_alerted(url, cooldown_h=12):
+    since = int(time.time()) - cooldown_h*3600
+    con = sqlite3.connect(DB_FILE)
+    row = con.execute("SELECT 1 FROM alerts WHERE url=? AND ts>=? LIMIT 1",
+                      (url, since)).fetchone()
+    con.close()
+    return bool(row)
+
+def save_alert(url, price, msg):
+    con = sqlite3.connect(DB_FILE)
+    con.execute("INSERT INTO alerts(url,ts,price,msg) VALUES(?,?,?,?)",
+                (url, int(time.time()), price, msg))
     con.commit(); con.close()
 
 def load_history(url, days=90):
@@ -129,7 +151,7 @@ def load_history(url, days=90):
     con.close()
     return [r[0] for r in rows]
 
-# ---------- Stats simples ----------
+# ---------- Stats & règle d'anomalie ----------
 def median(vals):
     s = sorted(vals); n = len(s)
     if n == 0: return None
@@ -143,17 +165,14 @@ def mad(vals, med):
     return m if m not in (None, 0) else 1.0
 
 def is_anomaly(current, hist):
-    # Seuil absolu: alerte immédiate même sans historique
     if current < ABS_FLOOR:
         return True, f"ANOMALIE: {current:.2f} < {ABS_FLOOR:.2f} (seuil absolu)"
-
     if len(hist) < MIN_POINTS:
         return False, f"Pas assez d'historique ({len(hist)}/{MIN_POINTS})."
-
     med = median(hist)
-    sigma = 1.4826 * mad(hist, med)           # écart-type robuste
-    seuil_rel = REL_FACTOR * med              # 40% de la médiane
-    seuil_rob = med - 3 * sigma               # borne basse robuste
+    sigma = 1.4826 * mad(hist, med)    # écart-type robuste
+    seuil_rel = REL_FACTOR * med
+    seuil_rob = med - 3 * sigma
     seuil = max(seuil_rel, seuil_rob)
     if current < seuil:
         return True, f"ANOMALIE: {current:.2f} < max({seuil_rel:.2f}, {seuil_rob:.2f}) (med={med:.2f})"
@@ -162,7 +181,7 @@ def is_anomaly(current, hist):
 # ---------- Main ----------
 def main():
     if not os.path.exists(CSV_URLS):
-        print("Créer d'abord urls.csv (url,nom)."); return
+        print("urls.csv manquant. Exécute d'abord collect_urls.py"); return
     init_db()
     with open(CSV_URLS, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -172,17 +191,16 @@ def main():
                 price = extract_price(url)
                 save_price(url, name, price)
                 hist = load_history(url)
-                anomaly, msg = is_anomaly(price, hist[:-1])  # compare au passé seulement
-
-                # Affichage et ALERTE
+                anomaly, msg = is_anomaly(price, hist[:-1])  # compare au passé
                 line = (("⚠️ " if anomaly else "✅ ") +
                         f"{name} | {price:.2f} | {msg} | {url}")
                 print(line)
-                if anomaly:
+                if anomaly and not recently_alerted(url):
                     send_telegram("Anomalie de prix détectée ⚠️\n" + line)
-
+                    save_alert(url, price, msg)
             except Exception as e:
                 print("❌", name, "|", url, "|", e)
 
 if __name__ == "__main__":
     main()
+
