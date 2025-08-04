@@ -3,11 +3,11 @@ name: DetecteurPrix
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # toutes les 30 min (UTC)
-  workflow_dispatch: {}      # bouton "Run workflow" manuel
+    - cron: "*/30 * * * *"     # toutes les 30 min (UTC)
+  workflow_dispatch: {}        # bouton "Run workflow"
 
 permissions:
-  contents: write            # pour committer prix.db
+  contents: write              # pour committer prix.db
 
 jobs:
   run:
