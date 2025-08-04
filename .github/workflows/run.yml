@@ -1,0 +1,44 @@
+
+name: DetecteurPrix
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # toutes les 30 min (UTC)
+  workflow_dispatch: {}      # bouton "Run workflow" manuel
+
+permissions:
+  contents: write            # pour committer prix.db
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build URL list (sitemaps)
+        run: python collect_urls.py
+
+      - name: Run detector
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python detector.py
+
+      - name: Commit DB if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f prix.db ]; then
+            git add prix.db
+            git commit -m "Update prix.db [skip ci]" || echo "No changes"
+            git push
+          fi
